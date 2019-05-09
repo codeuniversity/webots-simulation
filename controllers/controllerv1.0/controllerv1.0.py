@@ -1,14 +1,37 @@
 import math
 import time
 from controller import Robot
+import numpy as np
+from mpl_toolkits.mplot3d import Axes3D
+import matplotlib.pyplot as plt
+
+import threading
+import asyncio
+import websockets
+
+async def point_cloud_socket(websocket, path):
+    global point_cloud
+    while True:
+        await websocket.send(str(point_cloud))
+        await asyncio.sleep(1)
+
+start_server = websockets.serve(point_cloud_socket, 'localhost', 4000)
+
+asyncio.get_event_loop().run_until_complete(start_server)
+pc_thread = threading.Thread(target=asyncio.get_event_loop().run_forever)
+pc_thread.start()
+
 
 def degree_to_radiant(degree):
     return degree * (math.pi/180)
-TIME_STEP = 64
+
+TIME_STEP = 128
 MAX_SPEED = 2.76
 START_POSITION = 0
 MIN_MOTOR_POSITION = -57.2958
 MAX_MOTOR_POSITION = 57.2958
+
+point_cloud = []
 
 class MSEB(Robot):
 
@@ -32,6 +55,30 @@ class MSEB(Robot):
                     motor.setPosition(START_POSITION)
                     motor.setVelocity(MAX_SPEED)
                     self.leg_motors[leg_name][c] = motor
+
+        self.sensors = {}
+
+        sensor = self.getDistanceSensor('lidar')
+        sensor.enable(TIME_STEP)
+        self.sensors['lidar'] = sensor
+        sensor = self.getPositionSensor('lidar_base_position_sensor')
+        sensor.enable(TIME_STEP)
+        self.sensors['lidar_base_position_sensor'] = sensor
+        sensor = self.getPositionSensor('lidar_vertical_position_sensor')
+        sensor.enable(TIME_STEP)
+        self.sensors['lidar_vertical_position_sensor'] = sensor
+
+        self.other_motors = {}
+        motor = self.getMotor('lidar_base_motor')
+        motor.setPosition(float("inf"))
+        motor.setVelocity(6)
+        self.other_motors['lidar_base_motor'] = motor
+        motor = self.getMotor('lidar_motor_vertical')
+        motor.setVelocity(6)
+        motor.setPosition(0)
+        self.other_motors['lidar_motor_vertical'] = motor
+
+        self.position = [0,0,0]
 
     def set_knee_joint(self, leg_name, degree):
         global MIN_MOTOR_POSITION
@@ -129,15 +176,49 @@ class MSEB(Robot):
             yield 1
             yield 1
 
+    def update_map(self):
+        global point_cloud
+        length = self.sensors['lidar'].getValue()
+        if length < 3:
+            yaw = self.sensors['lidar_base_position_sensor'].getValue()
+            pitch = self.sensors['lidar_vertical_position_sensor'].getValue()
+            point = []
+            point.append(math.sin(yaw) * math.cos(pitch) * length )
+            point.append(math.sin(pitch) * length)
+            point.append(math.cos(yaw) * math.cos(pitch) * length )
+            point_cloud.append(point)
+
+    def update_lidar_position(self):
+        yaw = self.sensors['lidar_base_position_sensor'].getValue()
+        if yaw > 2*math.pi * self.lidar_rotations:
+            self.lidar_rotations += 1
+            old_vertical_position = self.sensors['lidar_vertical_position_sensor'].getValue()
+            print(old_vertical_position)
+            if self.wait_for_motor and old_vertical_position == 0:
+                self.wait_for_motor = False
+            if old_vertical_position >= 0.2:
+                self.wait_for_motor = True
+                self.other_motors['lidar_motor_vertical'].setPosition(0)
+            elif not self.wait_for_motor:
+                self.other_motors['lidar_motor_vertical'].setPosition(old_vertical_position + 0.01)
+
     def run(self):
         global TIME_STEP
+        global pc_thread
         i = 0
         self.reset()
         move = self.tripod_walk()
+        self.lidar_rotations = 0
+        self.wait_for_motor = False
         while(self.step(TIME_STEP)) != -1:
             if i > 20:
                 next(move)
+            self.update_map()
+            self.update_lidar_position()
             i += 1
+            print(point_cloud)
+        pc_thread.join(0.3)
+
 
 bot = MSEB()
 bot.initialize()
